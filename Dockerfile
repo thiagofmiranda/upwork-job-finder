@@ -1,19 +1,35 @@
-FROM public.ecr.aws/lambda/python:3.11
+FROM python:3.11-slim
 
-# Instalações do sistema
-RUN yum install -y unzip wget xz nss \
- && yum clean all
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Instala Python dependencies
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    unzip \
+    libnss3 \
+    libxss1 \
+    libasound2 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm-dev \
+    libxshmfence-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Instala o Playwright + browsers
-RUN pip install playwright \
- && playwright install --with-deps chromium
+# Install Python dependencies
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
-# Copia código
-COPY app/ ${LAMBDA_TASK_ROOT}
+# Install Playwright and its dependencies
+RUN pip install playwright && playwright install --with-deps chromium
 
-# Define o handler
-CMD ["lambda_function.lambda_handler"]
+# Copy application code
+COPY app/ /app/
+
+# Set working directory
+WORKDIR /app/
+
+# Define the command to run the application
+CMD ["python", "bot.py"]

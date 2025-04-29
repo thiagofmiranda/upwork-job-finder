@@ -4,11 +4,9 @@ import json
 from playwright.async_api import async_playwright
 import re
 from datetime import timedelta
-from twilio.rest import Client
 import pyarrow as pa
 import pyarrow.parquet as pq
 import duckdb
-from tqdm import tqdm
 import random
 
 def get_posted_datetime(timestamp, posted_text):
@@ -20,6 +18,8 @@ def get_posted_datetime(timestamp, posted_text):
 
     # Mapping of time units to timedelta arguments
     units = {
+        "second": "seconds",
+        "seconds": "seconds",
         "minute": "minutes",
         "minutes": "minutes",
         "hour": "hours",
@@ -44,7 +44,7 @@ def get_posted_datetime(timestamp, posted_text):
         return timestamp - timedelta(days=365)
     
     # Regex to find expressions like "posted 3 weeks ago"
-    match = re.search(r"posted\s+(\d+)\s+(minute|minutes|hour|hours|day|days|week|weeks|month|months)\s+ago", posted_text)
+    match = re.search(r"posted\s+(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)\s+ago", posted_text)
     if match:
         value = int(match.group(1))
         unit = match.group(2)
@@ -168,80 +168,74 @@ async def get_upwork_jobs(query_url, RAW_PATH):
             basename_template='raw_{i}.parquet'
         )
 
-import asyncio
+def staging_jobs(RAW_PATH, STAGING_PATH):
+    try:
+        df_raw = duckdb.query(f"""
+            SELECT 
+                *
+            FROM read_parquet('{RAW_PATH}/*.parquet')
+            ;
+        """).to_df()
+    except:
+        df_raw = pd.DataFrame(columns=["job_id"])
 
-async def staging_jobs(RAW_PATH, STAGING_PATH):
-    def sync_staging_jobs():
-        try:
-            df_raw = duckdb.query(f"""
-                SELECT 
-                    *
-                FROM read_parquet('{RAW_PATH}/*.parquet')
-                ;
-            """).to_df()
-        except:
-            df_raw = pd.DataFrame(columns=["job_id"])
+    try:
+        df_staging = duckdb.query(f"""
+            SELECT 
+                *
+            FROM read_parquet('{STAGING_PATH}/*.parquet')
+            ;
+        """).to_df()
+    except:
+        df_staging = pd.DataFrame(columns=["job_id"])
 
-        try:
-            df_staging = duckdb.query(f"""
-                SELECT 
-                    *
-                FROM read_parquet('{STAGING_PATH}/*.parquet')
-                ;
-            """).to_df()
-        except:
-            df_staging = pd.DataFrame(columns=["job_id"])
+    staging_job_ids = df_staging['job_id'].unique() if not df_staging.empty else []
+    print(f"Staging Step: Found {len(staging_job_ids)} staging job IDs.")
+    jobs_df = df_raw[~df_raw['job_id'].isin(staging_job_ids)]
+    print(f"Staging Step: Found {len(jobs_df)} new jobs to evaluate.")
+    
 
-        staging_job_ids = df_staging['job_id'].unique() if not df_staging.empty else []
-        print(f"Staging Step: Found {len(staging_job_ids)} staging job IDs.")
-        jobs_df = df_raw[~df_raw['job_id'].isin(staging_job_ids)]
-        print(f"Staging Step: Found {len(jobs_df)} new jobs to evaluate.")
+    if not jobs_df.empty:
+        jobs_df['post_date'] = jobs_df.apply(
+            lambda row: get_posted_datetime(row['datetime'], row['job_post_date']), axis=1
+        )
+        jobs_df['job_link'] = "http://www.upwork.com" + jobs_df['job_link']
 
-        if not jobs_df.empty:
-            jobs_df['post_date'] = jobs_df.apply(
-                lambda row: get_posted_datetime(row['datetime'], row['job_post_date']), axis=1
-            )
-            jobs_df['job_link'] = "http://www.upwork.com" + jobs_df['job_link']
+        for i, row in jobs_df.iterrows():
+            result = evaluate_job(row)
+            if i % 10 == 0:
+                print(f"Staging Step: Evaluating job {i} of {len(jobs_df)}")
+            for key in result.index:
+                jobs_df.loc[i, key] = result[key]
 
-            for i, row in tqdm(jobs_df.iterrows(), dynamic_ncols=False, total=len(jobs_df)):
-                result = evaluate_job(row)
-                if i % 10 == 0:
-                    print(f"Staging Step: Evaluating job {i} of {len(jobs_df)}")
-                for key in result.index:
-                    jobs_df.loc[i, key] = result[key]
+        df_staging = pd.concat([df_staging, jobs_df], ignore_index=True)
 
-            df_staging = pd.concat([df_staging, jobs_df], ignore_index=True)
+        jobs_df_schema = pa.schema([
+            ("job_id", pa.string()),
+            ("job_title", pa.string()),
+            ("job_description", pa.string()),
+            ("job_link", pa.string()),
+            ("job_post_date", pa.string()),
+            ("job_type_level", pa.string()),
+            ("job_experience_level", pa.string()),
+            ("is_fixed_price", pa.string()),
+            ("duration_label", pa.string()),
+            ("datetime", pa.timestamp('ns')),
+            ("match_level", pa.float64()),
+            ("apply", pa.bool_()),
+            ("reason", pa.string()),
+            ("model", pa.string())
+        ])
 
-            jobs_df_schema = pa.schema([
-                ("job_id", pa.string()),
-                ("job_title", pa.string()),
-                ("job_description", pa.string()),
-                ("job_link", pa.string()),
-                ("job_post_date", pa.string()),
-                ("job_type_level", pa.string()),
-                ("job_experience_level", pa.string()),
-                ("is_fixed_price", pa.string()),
-                ("duration_label", pa.string()),
-                ("datetime", pa.timestamp('ns')),
-                ("match_level", pa.float64()),
-                ("apply", pa.bool_()),
-                ("reason", pa.string()),
-                ("model", pa.string())
-            ])
+        pq.write_to_dataset(
+            pa.Table.from_pandas(df_staging, schema=jobs_df_schema, preserve_index=False), 
+            root_path=STAGING_PATH, 
+            basename_template='staging_{i}.parquet'
+        )
 
-            pq.write_to_dataset(
-                pa.Table.from_pandas(df_staging, schema=jobs_df_schema, preserve_index=False), 
-                root_path=STAGING_PATH, 
-                basename_template='staging_{i}.parquet'
-            )
-
-            print(f"Staging Step: All {len(jobs_df)} new jobs were evaluated.")
-        else:
-            print("Staging Step: No new jobs need evaluation.")
-
-    await asyncio.to_thread(sync_staging_jobs)
-
-
+        print(f"Staging Step: All {len(jobs_df)} new jobs were evaluated.")
+    else:
+        print("Staging Step: No new jobs need evaluation.")
 
 def json_to_table(json_data):
     """Convert JSON data to a pandas DataFrame."""
@@ -260,9 +254,8 @@ def build_prompt_filter(row):
         {
             "role": "system",
             "content": (
-                "You are a freelance job evaluator specialized in data science, machine learning, and automation. "
-                "Your job is to evaluate how well an Upwork job post aligns with the background and preferences of Thiago Miranda, "
-                "an experienced data scientist. Always respond in clean, valid JSON format with no additional commentary."
+                "You are an expert evaluator of freelance data science opportunities. Your task is to assess how well an Upwork job "
+                "post aligns with the professional profile of Thiago Miranda, a senior data scientist. Always return your response in valid, clean JSON format with no extra commentary."
             )
         },
         {
@@ -270,13 +263,16 @@ def build_prompt_filter(row):
             "content": (
                 "## Freelancer Profile – Thiago Miranda\n"
                 "- Location: Dublin, Ireland\n"
-                "- Experience: 6+ years in data science using Python, R, data analytics, statistical modeling, machine learning, and web scraping.\n"
-                "- Projects: Developed a complete Python tool to collect and analyze football data from scratch using web scraping, pandas, pyarrow, duckdb, and Streamlit to extract, transform, and present historical football data.\n"
-                "- Tools: Python, R, SQL, AWS (SageMaker, Lambda, EC2), Tableau, Power BI, Docker, Google Analytics, Git, APIs.\n"
-                "- Domains: Business, Education, Marketplaces, Marketing, and Digital Products.\n"
-                "- Preferences: Freelance jobs involving data scraping, analytics, dashboards, automations, or predictive modeling.\n"
+                "- Experience: 6+ years in data science and analytics using Python, R, and SQL, with strong expertise in machine learning, statistical modeling, web scraping, data visualization, and cloud services.\n"
+                "- Skills:\n"
+                "  • Data Science: machine learning (XGBoost, random forest, deep learning), NLP, LLMs, IRT models\n"
+                "  • Analytics: data wrangling, hypothesis testing, A/B testing, storytelling\n"
+                "  • Tools: Python, R, SQL (MySQL, Presto, SQL Server), AWS (SageMaker, Lambda, S3), Docker, Tableau, Power BI, Google Analytics, Git\n"
+                "- Projects: Created a football data analysis tool using web scraping, Streamlit, DuckDB, and PyArrow. Developed a CAT API integrated with Django for adaptive testing using IRT models.\n"
+                "- Domains: Education, Business, Marketplaces, Digital Products\n"
+                "- Education: MSc in Statistics, BSc in Statistics\n"
+                "- Preferences: Freelance roles involving ML, data analytics, automation, scraping, dashboards, or statistical modeling\n"
                 "- Languages: Portuguese (native), English (advanced)\n"
-                "- Availability: Full-time and part-time. Prefers well-defined or recurring projects.\n\n"
                 "## Job Post\n"
                 f"- Title: {row['job_title']}\n"
                 f"- Description: {row['job_description']}\n"
@@ -284,10 +280,10 @@ def build_prompt_filter(row):
                 f"- Fixed Price: {row['is_fixed_price']}\n"
                 f"- Duration: {row['duration_label']}\n\n"
                 "## Instructions\n"
-                "Evaluate how well the job post fits the freelancer profile and provide a response in valid JSON format with the following keys:\n"
-                "- match_level: a float between 0.0 and 1.0 representing the compatibility score\n"
+                "Evaluate how well this job post matches the freelancer profile and return your response in valid JSON format with the following keys:\n"
+                "- match_level: a float from 0.0 to 1.0 indicating compatibility\n"
                 "- apply: true or false\n"
-                "- reason: a short explanation for the decision\n\n"
+                "- reason: a short, clear explanation of your decision\n\n"
                 "## JSON Format\n"
                 "{\n"
                 "  \"match_level\": float,\n"

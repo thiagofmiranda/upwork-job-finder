@@ -16,15 +16,64 @@ SENT_PATH = os.getenv("SENT_PATH")
 APPLIED_PATH = os.getenv("APPLIED_PATH")
 
 
+async def send_jobs(channel, already_sent_ids):
+        
+        # Processa novos jobs
+        try:
+            job_df = duckdb.query(f"""
+                SELECT * FROM read_parquet('{STAGING_PATH}/*.parquet')
+                WHERE apply = TRUE
+                ORDER BY match_level;
+            """).to_df()
+        except:
+            job_df = pd.DataFrame(columns=["job_id"])
+        
+        await channel.send(f"🖨️ Sending Step: Found {len(job_df)} jobs to send.")
+        await channel.send(f"🖨️ Sending Step: Found {len(already_sent_ids)} jobs have been already sent.")
+        
+        job_df = job_df[job_df["job_id"].isin(already_sent_ids) == False]
+        await channel.send(f"🖨️ Sending Step: Found {len(job_df)} new jobs to send.")
+
+        for _, row in job_df.iterrows():
+            embed = discord.Embed(
+                title=row["job_title"],
+                description=row["job_description"][:4096] if len(row["job_description"]) > 4096 else row["job_description"],
+                color=discord.Color.yellow(),
+                url=row["job_link"]
+            )
+            embed.add_field(name="Job ID", value=row["job_id"], inline=True)
+            embed.add_field(name="Experience Level", value=row["job_type_level"], inline=True)
+            embed.add_field(name="Duration", value=row["duration_label"], inline=True)
+            embed.add_field(name="Fixed Price?", value="✅" if row["is_fixed_price"] else "❌", inline=True)
+            embed.add_field(name="Match Level", value=row["match_level"], inline=True)
+            embed.add_field(name="Reason", value=row["reason"], inline=False)
+
+            await channel.send(embed=embed, view=JobView(row=row, APPLIED_PATH=APPLIED_PATH))
+
+            # Adiciona aos enviados
+            already_sent_ids.append(row["job_id"])
+            file_name = f'{SENT_PATH}/jobs-sent.csv'
+            row_df = pd.DataFrame([row])
+            if os.path.exists(file_name):
+                row_df.to_csv(file_name, mode='a', index=False, header=False)
+            else:
+                row_df.to_csv(file_name, mode='w', index=False, header=True)
+
+
 async def run_core(channel, STAGING_PATH=STAGING_PATH, SENT_PATH=SENT_PATH, APPLIED_PATH=APPLIED_PATH):
     await channel.send("🚀 Running job process...")
-
+    
     # Executa o scraper
     process = await asyncio.create_subprocess_exec(
-        "python", "app/scripts/main.py",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    "python", "-u", "app/scripts/main.py",  # Adiciona o flag -u para desativar o buffering
+    stdout=asyncio.subprocess.PIPE,
+    stderr=asyncio.subprocess.PIPE,
+    env={**os.environ, "PYTHONUNBUFFERED": "1"}  # Garante que o subprocesso use saída não bufferizada
+)
+
+    # stdout, stderr = await process.communicate()
+    # print(f"STDOUT: {stdout.decode()}")
+    # print(f"STDERR: {stderr.decode()}")
 
     while True:
         line = await process.stdout.readline()
@@ -39,47 +88,8 @@ async def run_core(channel, STAGING_PATH=STAGING_PATH, SENT_PATH=SENT_PATH, APPL
     # Carrega jobs já enviados
     already_sent_ids = pd.read_csv(f'{SENT_PATH}/jobs-sent.csv')['job_id'].tolist() if os.path.exists(f'{SENT_PATH}/jobs-sent.csv') else []
 
-    # Processa novos jobs
-    try:
-        job_df = duckdb.query(f"""
-            SELECT * FROM read_parquet('{STAGING_PATH}/*.parquet')
-            WHERE apply = TRUE
-            ORDER BY match_level;
-        """).to_df()
-    except:
-        job_df = pd.DataFrame(columns=["job_id"])
+    await send_jobs(channel, already_sent_ids)
     
-    await channel.send(f"🖨️ Sending Step: Found {len(job_df)} jobs to send.")
-    await channel.send(f"🖨️ Sending Step: Found {len(already_sent_ids)} jobs have been already sent.")
-    
-    job_df = job_df[job_df["job_id"].isin(already_sent_ids) == False]
-    await channel.send(f"🖨️ Sending Step: Found {len(job_df)} new jobs to send.")
-
-    for _, row in job_df.iterrows():
-        embed = discord.Embed(
-            title=row["job_title"],
-            description=row["job_description"],
-            color=discord.Color.yellow(),
-            url=row["job_link"]
-        )
-        embed.add_field(name="Job ID", value=row["job_id"], inline=True)
-        embed.add_field(name="Experience Level", value=row["job_type_level"], inline=True)
-        embed.add_field(name="Duration", value=row["duration_label"], inline=True)
-        embed.add_field(name="Fixed Price?", value="✅" if row["is_fixed_price"] else "❌", inline=True)
-        embed.add_field(name="Match Level", value=row["match_level"], inline=True)
-        embed.add_field(name="Reason", value=row["reason"], inline=False)
-
-        await channel.send(embed=embed, view=JobView(row=row, APPLIED_PATH=APPLIED_PATH))
-
-        # Adiciona aos enviados
-        already_sent_ids.append(row["job_id"])
-        file_name = f'{SENT_PATH}/jobs-sent.csv'
-        row_df = pd.DataFrame([row])
-        if os.path.exists(file_name):
-            row_df.to_csv(file_name, mode='a', index=False, header=False)
-        else:
-            row_df.to_csv(file_name, mode='w', index=False, header=True)
-
     await channel.send("✅ Job process finished!")
 
 
@@ -183,7 +193,7 @@ async def delete_all(ctx):
     else:
         await ctx.send("Channel not found.")
 
-@bot.tree.command(name="run_scraper", description="Executa o scraping")
+@bot.tree.command(name="run_scraper", description="Run scraping")
 @commands.has_permissions(administrator=True)
 async def run_script(ctx):
     try:
@@ -193,6 +203,19 @@ async def run_script(ctx):
     except Exception as e:
         await channel.send(f"⚠️ Exceção: {e}")
 
+@bot.tree.command(name="resend_last_jobs", description="Send jobs")
+@commands.has_permissions(administrator=True)
+async def resend_last_jobs(ctx, n_last: int = 10):
+    try:
+        channel = bot.get_channel(int(CHANNEL_ID))
+
+        already_sent_ids = pd.read_csv(f'{SENT_PATH}/jobs-sent.csv')['job_id'].tolist() if os.path.exists(f'{SENT_PATH}/jobs-sent.csv') else []
+        # remover os últimos n_last ids da lista
+        already_sent_ids = already_sent_ids[:-n_last] if len(already_sent_ids) > n_last else []
+        await send_jobs(channel, already_sent_ids)
+        
+    except Exception as e:
+        await channel.send(f"⚠️ Exceção: {e}")
 
 bot.run(TOKEN)
 

@@ -1,1 +1,9 @@
 playwright
+pandas
+openai
+python-dotenv
+duckdb
+pyarrow
+tqdm
+twilio
+discord.py
